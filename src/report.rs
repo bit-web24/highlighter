@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::Write;
 use tokio::time::{Duration, sleep};
+use tracing::{info, warn, error, instrument};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -129,9 +130,10 @@ fn backoff_secs(err: &str, attempt: u64) -> u64 {
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Navigates to the inner article page and extracts its structured content.
+#[instrument(skip(page), fields(url))]
 pub async fn fetch_content(page: &Page, url: &str) -> Res<Detail> {
     let target = inner_url(url);
-    eprintln!("[fetch] → {target}");
+    info!(target = %target, "navigating to article page");
     page.goto(&target).await?;
 
     // Wait for content div OR block page — failing fast on bot-detection
@@ -149,6 +151,7 @@ pub async fn fetch_content(page: &Page, url: &str) -> Res<Detail> {
 
     let title: String = page.evaluate("document.title").await?.into_value()?;
     if title.contains("Access Denied") {
+        error!("blocked by bot protection");
         return Err("blocked by bot protection".into());
     }
 
@@ -158,19 +161,20 @@ pub async fn fetch_content(page: &Page, url: &str) -> Res<Detail> {
         return Err("empty body (image-only release or layout change?)".into());
     }
     if detail.title.is_empty() || detail.published.is_empty() {
-        eprintln!("[fetch] warning: missing title/date for {url}");
+        warn!(url, "article is missing title or date");
     }
 
-    eprintln!("[fetch] ✓ {}", detail.title.chars().take(60).collect::<String>());
+    info!(title = %detail.title, "article fetched");
     Ok(detail)
 }
 
 /// Fetches a single article with up to `MAX_ATTEMPTS` retries.
+#[instrument(skip(page), fields(url = %item.url))]
 pub async fn fetch_one(page: &Page, item: &Item) -> Res<Article> {
     let mut last_err = String::new();
 
     for attempt in 1..=MAX_ATTEMPTS {
-        eprintln!("[fetch_one] attempt {attempt}/{MAX_ATTEMPTS}: {}", item.url);
+        info!(attempt, max = MAX_ATTEMPTS, "fetching article");
         match fetch_content(page, &item.url).await {
             Ok(detail) => {
                 return Ok(Article {
@@ -181,17 +185,19 @@ pub async fn fetch_one(page: &Page, item: &Item) -> Res<Article> {
             Err(e) => {
                 last_err = e.to_string();
                 let wait = backoff_secs(&last_err, attempt);
-                eprintln!("[fetch_one] attempt {attempt} failed ({last_err}) — waiting {wait}s …");
+                warn!(attempt, error = %last_err, wait_secs = wait, "attempt failed, retrying");
                 sleep(Duration::from_secs(wait)).await;
             }
         }
     }
 
+    error!(max = MAX_ATTEMPTS, error = %last_err, "all attempts exhausted");
     Err(format!("failed after {MAX_ATTEMPTS} attempts: {last_err}").into())
 }
 
 /// Fetches all articles from `items`, appending results (as NDJSON) to `out_path`.
 /// Already-fetched URLs (present in the file) are skipped automatically.
+#[instrument(skip(page, items), fields(out_path, total = items.len()))]
 pub async fn fetch_all(page: &Page, items: &[Item], out_path: &str) -> Res<(usize, usize)> {
     // Build a set of URLs already written to the output file
     let done: HashSet<String> = std::fs::read_to_string(out_path)
@@ -203,9 +209,7 @@ pub async fn fetch_all(page: &Page, items: &[Item], out_path: &str) -> Res<(usiz
 
     let skipped = done.len();
     let remaining = items.iter().filter(|i| !done.contains(&i.url)).count();
-    eprintln!(
-        "[fetch_all] {skipped} already done, {remaining} to fetch → {out_path}"
-    );
+    info!(skipped, remaining, out_path, "starting fetch_all");
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -220,7 +224,7 @@ pub async fn fetch_all(page: &Page, items: &[Item], out_path: &str) -> Res<(usiz
             continue;
         }
 
-        eprintln!("[fetch_all] [{}/{total}] {}", n + 1, item.url);
+        info!(n = n + 1, total, url = %item.url, "fetching item");
 
         let mut detail = None;
         for attempt in 1..=MAX_ATTEMPTS {
@@ -232,10 +236,10 @@ pub async fn fetch_all(page: &Page, items: &[Item], out_path: &str) -> Res<(usiz
                 Err(e) => {
                     let err_str = e.to_string();
                     let wait = backoff_secs(&err_str, attempt);
-                    eprintln!(
-                        "[fetch_all] [{}/{total}] attempt {attempt}/{MAX_ATTEMPTS} failed \
-                         ({err_str}) — waiting {wait}s …",
-                        n + 1
+                    warn!(
+                        n = n + 1, total, attempt, max = MAX_ATTEMPTS,
+                        error = %err_str, wait_secs = wait,
+                        "attempt failed, retrying"
                     );
                     sleep(Duration::from_secs(wait)).await;
                 }
@@ -248,10 +252,10 @@ pub async fn fetch_all(page: &Page, items: &[Item], out_path: &str) -> Res<(usiz
                 writeln!(file, "{}", serde_json::to_string(&article)?)?;
                 file.flush()?; // flush after each write to survive a crash mid-run
                 ok += 1;
-                eprintln!("[fetch_all] [{}/{total}] ✓ saved", n + 1);
+                info!(n = n + 1, total, "item saved");
             }
             None => {
-                eprintln!("[fetch_all] [{}/{total}] ✗ giving up on {}", n + 1, item.url);
+                error!(n = n + 1, total, url = %item.url, "gave up on item after all attempts");
                 failed += 1;
             }
         }
@@ -259,6 +263,6 @@ pub async fn fetch_all(page: &Page, items: &[Item], out_path: &str) -> Res<(usiz
         sleep(Duration::from_millis(INTER_FETCH_PAUSE_MS)).await; // be polite
     }
 
-    eprintln!("[fetch_all] done — {ok} ok, {failed} failed");
+    info!(ok, failed, "fetch_all complete");
     Ok((ok, failed))
 }

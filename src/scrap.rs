@@ -2,6 +2,7 @@ use chromiumoxide::Page;
 use serde::Deserialize;
 use std::time::Duration;
 use tokio::time::sleep;
+use tracing::{debug, info, warn, error};
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -73,7 +74,7 @@ pub async fn dump_html(page: &Page) -> Res<()> {
         .await?
         .into_value()?;
     std::fs::write("dump.html", html)?;
-    eprintln!("[debug] page HTML saved → dump.html");
+    debug!("page HTML saved → dump.html");
     Ok(())
 }
 
@@ -90,11 +91,11 @@ pub async fn get_value(page: &Page, id: &str) -> Res<String> {
 pub async fn set_select(page: &Page, id: &str, value: &str) -> Res<()> {
     let current = get_value(page, id).await?;
     if current == value {
-        eprintln!("[filter] {id} already = {value:?}, skipping postback");
+        debug!(id, value, "select already at target, skipping postback");
         return Ok(());
     }
 
-    eprintln!("[filter] {id}: {current:?} → {value:?} (postback …)");
+    info!(id, from = %current, to = %value, "setting select (postback)");
 
     // Plant a marker that disappears when the postback reloads the page
     page.evaluate("window.__marker = true").await?;
@@ -123,7 +124,7 @@ pub async fn set_select(page: &Page, id: &str, value: &str) -> Res<()> {
         return Err(format!("{id} is '{now}', wanted '{value}'").into());
     }
 
-    eprintln!("[filter] {id} confirmed = {value:?}");
+    debug!(id, value, "select confirmed");
     Ok(())
 }
 
@@ -131,10 +132,10 @@ pub async fn set_select(page: &Page, id: &str, value: &str) -> Res<()> {
 
 /// Navigates to the PIB listing page, applies filters, and returns all press-release items.
 pub async fn scrape(page: &Page) -> Res<Vec<Item>> {
-    eprintln!("[scrape] opening listing page …");
+    info!(url = LISTING_URL, "opening listing page");
     page.goto(LISTING_URL).await?;
 
-    eprintln!("[scrape] waiting for form to appear …");
+    info!("waiting for filter form");
     wait_for(
         page,
         "document.readyState === 'complete' && !!document.getElementById('ContentPlaceHolder1_ddlMinistry')",
@@ -145,18 +146,19 @@ pub async fn scrape(page: &Page) -> Res<Vec<Item>> {
 
     let title: String = page.evaluate("document.title").await?.into_value()?;
     if title.contains("Access Denied") {
+        error!("blocked by bot protection");
         return Err("blocked by bot protection".into());
     }
-    eprintln!("[scrape] page title: {title:?}");
+    debug!(page_title = %title, "listing page loaded");
 
     // Apply filters — each triggers one ASP.NET postback (full reload)
-    eprintln!("[scrape] applying filters …");
+    info!("applying filters");
     set_select(page, "ContentPlaceHolder1_ddlMinistry", "0").await?; // all ministries
     set_select(page, "ContentPlaceHolder1_ddlday", "0").await?;       // all days
     set_select(page, "ContentPlaceHolder1_ddlMonth", "9").await?;     // september
     set_select(page, "ContentPlaceHolder1_ddlYear", "2026").await?;
 
-    eprintln!("[scrape] waiting for .content-area …");
+    info!("waiting for .content-area");
     if wait_for(page, "!!document.querySelector('.content-area')", 100)
         .await
         .is_err()
@@ -165,7 +167,7 @@ pub async fn scrape(page: &Page) -> Res<Vec<Item>> {
         return Err("no .content-area, saved dump.html".into());
     }
 
-    eprintln!("[scrape] extracting items …");
+    info!("extracting items");
     let items: Vec<Item> = page.evaluate(EXTRACT_JS).await?.into_value()?;
 
     if items.is_empty() {
@@ -177,14 +179,15 @@ pub async fn scrape(page: &Page) -> Res<Vec<Item>> {
     let no_ministry = items.iter().filter(|i| i.ministry.is_empty()).count();
     let no_date = items.iter().filter(|i| i.published.is_empty()).count();
     if no_ministry > 0 || no_date > 0 {
-        eprintln!(
-            "[scrape] warning: {no_ministry}/{} missing ministry, {no_date}/{} missing date",
-            items.len(),
-            items.len()
+        warn!(
+            no_ministry,
+            no_date,
+            total = items.len(),
+            "some items are missing ministry or date"
         );
         dump_html(page).await?;
     }
 
-    eprintln!("[scrape] found {} items", items.len());
+    info!(count = items.len(), "scrape complete");
     Ok(items)
 }
