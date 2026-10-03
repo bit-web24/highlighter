@@ -3,10 +3,11 @@ use serde::Deserialize;
 use std::time::Duration;
 use tokio::time::sleep;
 
+// ─── Types ───────────────────────────────────────────────────────────────────
+
 pub type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
-const URL: &str = "https://www.pib.gov.in/allRel.aspx?reg=48&lang=1";
-
+/// One press-release entry scraped from the listing page.
 #[derive(Debug, Deserialize)]
 pub struct Item {
     pub url: String,
@@ -15,8 +16,12 @@ pub struct Item {
     pub published: String,
 }
 
-// walks headings + release links in document order. a heading sets the
-// current ministry, each PRID link takes the latest one seen above it
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+const LISTING_URL: &str = "https://www.pib.gov.in/allRel.aspx?reg=48&lang=1";
+
+/// Walks headings + release links in document order.
+/// A heading sets the current ministry; each PRID link takes the latest one seen above it.
 const EXTRACT_JS: &str = r#"
 (() => {
   const root = document.querySelector('.content-area');
@@ -44,10 +49,13 @@ const EXTRACT_JS: &str = r#"
 })()
 "#;
 
-// poll a js expression until it's true. no cdp node ids, so it survives reloads
+// ─── Browser Helpers ─────────────────────────────────────────────────────────
+
+/// Polls a JS expression (200 ms interval) until it evaluates to `true`.
+/// Uses no CDP node IDs, so it survives page reloads.
 pub async fn wait_for(page: &Page, js: &str, tries: u32) -> Res<()> {
     for _ in 0..tries {
-        // evaluate can error mid-navigation, just keep polling
+        // evaluate() can error mid-navigation — just keep polling
         if let Ok(r) = page.evaluate(js).await {
             if let Ok(true) = r.into_value::<bool>() {
                 return Ok(());
@@ -58,15 +66,18 @@ pub async fn wait_for(page: &Page, js: &str, tries: u32) -> Res<()> {
     Err(format!("timed out waiting for: {js}").into())
 }
 
+/// Dumps the current page's full HTML to `dump.html` for debugging.
 pub async fn dump_html(page: &Page) -> Res<()> {
     let html: String = page
         .evaluate("document.documentElement.outerHTML")
         .await?
         .into_value()?;
     std::fs::write("dump.html", html)?;
+    eprintln!("[debug] page HTML saved → dump.html");
     Ok(())
 }
 
+/// Returns the current value of a `<select>` / `<input>` element by its `id`.
 pub async fn get_value(page: &Page, id: &str) -> Res<String> {
     Ok(page
         .evaluate(format!("document.getElementById('{id}').value"))
@@ -74,12 +85,18 @@ pub async fn get_value(page: &Page, id: &str) -> Res<String> {
         .into_value()?)
 }
 
+/// Sets a `<select>` element to `value` and waits for the ASP.NET postback to finish.
+/// No-ops if the element already has the desired value.
 pub async fn set_select(page: &Page, id: &str, value: &str) -> Res<()> {
-    if get_value(page, id).await? == value {
-        return Ok(()); // already set, no postback needed
+    let current = get_value(page, id).await?;
+    if current == value {
+        eprintln!("[filter] {id} already = {value:?}, skipping postback");
+        return Ok(());
     }
 
-    // marker disappears when the postback reloads the page
+    eprintln!("[filter] {id}: {current:?} → {value:?} (postback …)");
+
+    // Plant a marker that disappears when the postback reloads the page
     page.evaluate("window.__marker = true").await?;
     page.evaluate(format!(
         r#"(() => {{
@@ -90,10 +107,10 @@ pub async fn set_select(page: &Page, id: &str, value: &str) -> Res<()> {
     ))
     .await?;
 
-    // wait until the old document is gone (marker cleared)
+    // Wait until the old document is gone (marker cleared by reload)
     wait_for(page, "window.__marker !== true", 100).await?;
 
-    // wait until the new document is ready and has the select again
+    // Wait until the new document is ready and the select is back
     wait_for(
         page,
         &format!("document.readyState === 'complete' && !!document.getElementById('{id}')"),
@@ -105,12 +122,19 @@ pub async fn set_select(page: &Page, id: &str, value: &str) -> Res<()> {
     if now != value {
         return Err(format!("{id} is '{now}', wanted '{value}'").into());
     }
+
+    eprintln!("[filter] {id} confirmed = {value:?}");
     Ok(())
 }
 
-pub async fn scrape(page: &Page) -> Res<Vec<Item>> {
-    page.goto(URL).await?;
+// ─── Public API ──────────────────────────────────────────────────────────────
 
+/// Navigates to the PIB listing page, applies filters, and returns all press-release items.
+pub async fn scrape(page: &Page) -> Res<Vec<Item>> {
+    eprintln!("[scrape] opening listing page …");
+    page.goto(LISTING_URL).await?;
+
+    eprintln!("[scrape] waiting for form to appear …");
     wait_for(
         page,
         "document.readyState === 'complete' && !!document.getElementById('ContentPlaceHolder1_ddlMinistry')",
@@ -123,13 +147,16 @@ pub async fn scrape(page: &Page) -> Res<Vec<Item>> {
     if title.contains("Access Denied") {
         return Err("blocked by bot protection".into());
     }
+    eprintln!("[scrape] page title: {title:?}");
 
-    // one postback (full reload) per change
-    set_select(page, "ContentPlaceHolder1_ddlMinistry", "0").await?; // all ministry
-    set_select(page, "ContentPlaceHolder1_ddlday", "0").await?; // all days
-    set_select(page, "ContentPlaceHolder1_ddlMonth", "9").await?; // september
+    // Apply filters — each triggers one ASP.NET postback (full reload)
+    eprintln!("[scrape] applying filters …");
+    set_select(page, "ContentPlaceHolder1_ddlMinistry", "0").await?; // all ministries
+    set_select(page, "ContentPlaceHolder1_ddlday", "0").await?;       // all days
+    set_select(page, "ContentPlaceHolder1_ddlMonth", "9").await?;     // september
     set_select(page, "ContentPlaceHolder1_ddlYear", "2026").await?;
 
+    eprintln!("[scrape] waiting for .content-area …");
     if wait_for(page, "!!document.querySelector('.content-area')", 100)
         .await
         .is_err()
@@ -138,6 +165,7 @@ pub async fn scrape(page: &Page) -> Res<Vec<Item>> {
         return Err("no .content-area, saved dump.html".into());
     }
 
+    eprintln!("[scrape] extracting items …");
     let items: Vec<Item> = page.evaluate(EXTRACT_JS).await?.into_value()?;
 
     if items.is_empty() {
@@ -145,17 +173,18 @@ pub async fn scrape(page: &Page) -> Res<Vec<Item>> {
         return Err("0 items (no PRID links?), saved dump.html".into());
     }
 
-    // fail loud if the markup guesses were wrong
+    // Warn if the markup guesses were wrong for any items
     let no_ministry = items.iter().filter(|i| i.ministry.is_empty()).count();
     let no_date = items.iter().filter(|i| i.published.is_empty()).count();
     if no_ministry > 0 || no_date > 0 {
         eprintln!(
-            "warning: {no_ministry}/{} missing ministry, {no_date}/{} missing date, saved dump.html",
+            "[scrape] warning: {no_ministry}/{} missing ministry, {no_date}/{} missing date",
             items.len(),
             items.len()
         );
         dump_html(page).await?;
     }
 
+    eprintln!("[scrape] found {} items", items.len());
     Ok(items)
 }
